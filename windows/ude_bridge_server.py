@@ -389,9 +389,12 @@ def main():
         from dialog_sentinel import DialogSentinel
         sentinel = DialogSentinel(config)
         sentinel.start()
+        # backend 加载程序后把 ELF 所在目录登记为源文件搜索根
+        backend.dialog_sentinel = sentinel
         if sentinel.enabled:
             print(f"[init] dialog sentinel on (action={sentinel.action}, "
-                  f"source_roots={len(config.get('source_roots') or [])})",
+                  f"source_roots={len(config.get('source_roots') or [])}, "
+                  f"blockers={len(sentinel.blockers)})",
                   file=sys.stderr)
     except Exception as e:
         print(f"[init] dialog sentinel not started: {e}", file=sys.stderr)

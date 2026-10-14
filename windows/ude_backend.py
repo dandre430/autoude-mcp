@@ -50,6 +50,32 @@ def _parse_int(value) -> int:
     raise BackendError(proto.ERR_BAD_REQUEST, f"bad integer value: {value!r}")
 
 
+# 默认不烧的 Flash 模块特征（子串匹配 Name/Description，不区分大小写）。
+# OTP/UCB/BMHD 是一次性可编程区，烧错无法挽回——开箱默认跳过；
+# 确要烧时用 ude_load_program(program_all=True) 显式覆盖。
+DEFAULT_FLASH_SKIP = ("OTP", "UCB", "BMHD")
+
+
+def _resolve_skip_list(config, params):
+    """烧写跳过列表：工具参数 skip_modules > config flash_skip_modules > 默认值。
+    program_all=True 时清空（不做任何跳过）。返回小写子串列表。"""
+    if params.get("program_all"):
+        return []
+    raw = params.get("skip_modules")
+    if raw is None:
+        raw = config.get("flash_skip_modules")
+    if raw is None:
+        raw = DEFAULT_FLASH_SKIP
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    out = []
+    for s in raw:
+        s = str(s).strip().lower()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
 # =====================================================================
 # Mock 后端
 # =====================================================================
@@ -86,7 +112,8 @@ class MockUdeBackend:
     # ---- 会话 ----
     def ping(self, params):
         return {"pong": True, "backend": self.name,
-                "default_wsx": self.config.get("default_wsx") or ""}
+                "default_wsx": self.config.get("default_wsx") or "",
+                "default_elf": self.config.get("default_elf") or ""}
 
     def start_session(self, params):
         wsx = params.get("wsx") or self.config.get("default_wsx") or "mock.wsx"
@@ -129,13 +156,17 @@ class MockUdeBackend:
 
     def load_program(self, params):
         _require_session(self.__dict__)
-        path = params.get("path")
+        # path 两级来源：工具参数优先，否则 config 的 default_elf（与 wsx 同套路）
+        path = params.get("path") or self.config.get("default_elf")
         if not path:
-            raise BackendError(proto.ERR_BAD_REQUEST, "missing param: path")
+            raise BackendError(proto.ERR_BAD_REQUEST,
+                               "load_program: no elf — pass the elf tool parameter, "
+                               'or set "default_elf" in windows/config.json')
         self.program_file = path
         mode = "verify" if params.get("verify_only") else ("flash" if params.get("flash", True) else "load")
         self._log("success", f"[mock] {mode} program: {path}")
-        return {"loaded": True, "path": path, "mode": mode, "strategy": "mock"}
+        return {"loaded": True, "path": path, "mode": mode, "strategy": "mock",
+                "flash_skip": _resolve_skip_list(self.config, params)}
 
     def flash_info(self, params):
         _require_session(self.__dict__)
@@ -386,6 +417,7 @@ class RealUdeBackend:
         self.attached_mode = False
         self._local_breakpoints = []   # COM 枚举能力弱，自行记录描述
         self.last_program_path = None  # 最近加载过的程序文件（符号来源）
+        self.dialog_sentinel = None    # bridge_server 挂上后，加载 ELF 时登记源根
 
     # ---- COM 基础 ----
     def _dispatch(self, prog_id):
@@ -628,7 +660,8 @@ class RealUdeBackend:
     # ---- 会话 ----
     def ping(self, params):
         return {"pong": True, "backend": self.name, "ude_exe": self.ude_exe,
-                "default_wsx": self.config.get("default_wsx") or ""}
+                "default_wsx": self.config.get("default_wsx") or "",
+                "default_elf": self.config.get("default_elf") or ""}
 
     def start_session(self, params):
         # wsx 两级来源：工具参数优先，否则用 windows/config.json 的 default_wsx
@@ -783,12 +816,62 @@ class RealUdeBackend:
         """取当前核关联的 Memtool（FLASH 编程插件），即 UI「Program All」的执行体。"""
         return self._com_call(dbg.GetMemtool)
 
+    def _probe_sections(self, container, count):
+        """文件段/模块段的地址窗清单（GetSection 等多形态探测）。
+
+        直接回答“这次会烧哪些地址”。API 名对不上就返回 []，调用方省略该字段。
+        """
+        out = []
+        for i in range(min(int(count or 0), 64)):
+            sec = None
+            for gname in ("GetSection", "GetFileSection", "Section", "FileSection"):
+                getter = getattr(container, gname, None)
+                if getter is None:
+                    continue
+                try:
+                    sec = self._com_call(getter, i)
+                    break
+                except Exception:
+                    continue
+            if sec is None:
+                return []
+            item = {"index": i}
+            for attr, key in (("Name", "name"), ("Description", "description"),
+                              ("StartAddress", "start"), ("StartAddr", "start"),
+                              ("Address", "start"), ("Addr", "start"),
+                              ("Size", "size")):
+                try:
+                    v = self._com_call(lambda s=sec, a=attr: getattr(s, a))
+                    if callable(v):
+                        v = v()
+                    if v is not None:
+                        item[key] = _jsonify(v)
+                except Exception:
+                    continue
+            if "start" not in item:
+                try:
+                    rng = self._com_call(sec.Range, 0)
+                    item["start"] = int(self._com_call(lambda r=rng: r.ProgTimeStartAddr))
+                    item.setdefault("size", int(self._com_call(lambda r=rng: r.Size)))
+                except Exception:
+                    pass
+            if isinstance(item.get("start"), int):
+                item["start_hex"] = hex(item["start"] & 0xFFFFFFFF)
+            out.append(item)
+        return out
+
     def _memtool_info(self, memtool):
         info = {}
         try:
             info["num_of_file_sections"] = int(self._com_call(lambda: memtool.NumOfFileSections))
         except Exception:
             info["num_of_file_sections"] = None
+        try:
+            secs = self._probe_sections(memtool, info["num_of_file_sections"])
+            if secs:
+                info["file_sections"] = secs
+        except Exception:
+            pass
         mods = []
         try:
             count = int(self._com_call(lambda: memtool.NumOfFlashMods))
@@ -822,6 +905,13 @@ class RealUdeBackend:
                         end = (int(self._com_call(lambda r=rlast: r.ProgTimeStartAddr))
                                + int(self._com_call(lambda r=rlast: r.Size)))
                         entry["addr_range"] = f"0x{start & 0xFFFFFFFF:08X}-0x{end & 0xFFFFFFFF:08X}"
+                except Exception:
+                    pass
+                # 数据段地址窗（文件落在本模块的段；取不到则省略）
+                try:
+                    secs = self._probe_sections(mod, entry.get("num_of_sections") or 0)
+                    if secs:
+                        entry["sections"] = secs
                 except Exception:
                     pass
             except Exception as e:
@@ -877,9 +967,20 @@ class RealUdeBackend:
         return {"cores": cores, "files": files}
 
     def load_program(self, params):
-        path = params.get("path")
+        # path 两级来源：工具参数优先，否则 config 的 default_elf（与 wsx 同套路）
+        path = params.get("path") or self.config.get("default_elf")
         if not path:
-            raise BackendError(proto.ERR_BAD_REQUEST, "missing param: path")
+            raise BackendError(
+                proto.ERR_BAD_REQUEST,
+                "load_program: no elf — pass the elf tool parameter, or set "
+                '"default_elf" in windows/config.json')
+        path = os.path.expandvars(str(path))
+        if not os.path.isabs(path):
+            raise BackendError(proto.ERR_BAD_REQUEST,
+                               f"load_program: elf must be an absolute path: {path}")
+        if not os.path.isfile(path):
+            raise BackendError(proto.ERR_BAD_REQUEST,
+                               f"load_program: file not found: {path}")
         dbg = self._check_target()
         strategy = (params.get("strategy") or "auto").lower()
         # auto 不含 multicore：DoDownload 会跑完整下载配置（曾拉起 OTP Memory
@@ -893,6 +994,9 @@ class RealUdeBackend:
         if strategy not in orders:
             raise BackendError(proto.ERR_BAD_REQUEST,
                                f"unknown strategy: {strategy} (auto|memtool|load_and_flash|multicore)")
+        # 烧写保护：跳过 OTP/UCB/BMHD 类一次性区（见 _load_memtool_inner）
+        params = dict(params)
+        params["_flash_skip"] = _resolve_skip_list(self.config, params)
         attempts = []
         for name in orders[strategy]:
             fn = getattr(self, f"_load_{name}")
@@ -908,12 +1012,24 @@ class RealUdeBackend:
                 self.last_program_path = path
                 result.update({"loaded": True, "path": path, "strategy": name,
                                "attempts": attempts,
+                               "flash_skip": params["_flash_skip"],
                                "symbols": self._load_symbols_all_cores(path)})
+                self._note_source_root(path)
                 return result
             attempts.append({"strategy": name, "error": result.get("error") or "returned false"})
         raise BackendError(
             proto.ERR_BACKEND,
             f"load program failed for {path}; attempts={attempts}")
+
+    def _note_source_root(self, path):
+        """把程序所在目录登记给弹框哨兵，源文件定位框多一条自动填充线索。"""
+        sent = getattr(self, "dialog_sentinel", None)
+        if sent is None:
+            return
+        try:
+            sent.add_root(os.path.dirname(os.path.abspath(path)))
+        except Exception:
+            pass
 
     def _load_symbols_all_cores(self, path):
         """把程序文件（符号）装进每个核调试器——变量/断点依赖符号。
@@ -1021,15 +1137,41 @@ class RealUdeBackend:
             notes.append(f"ConnectTarget -> {ok}")
 
         # 1. 擦除/校验模式（仅使能模块）+ 收集参与烧写的模块
+        #    烧哪些地址不由我们指定：文件段落在哪个 Flash 模块的地址窗内，
+        #    就由哪个模块烧。这里能控制的是“哪些模块不烧”——
+        #    skip 列表（默认 OTP/UCB/BMHD 一次性区）命中的直接排除。
         mods = []
+        skipped_safety = []
+        skip_list = params.get("_flash_skip") or []
         count = int(self._com_call(lambda: memtool.NumOfFlashMods))
         for i in range(count):
             mod = self._com_call(memtool.GetFlashMod, i)
+            name = desc = ""
+            try:
+                name = str(self._com_call(lambda m=mod: m.Name))
+            except Exception:
+                pass
+            try:
+                desc = str(self._com_call(lambda m=mod: m.Description))
+            except Exception:
+                pass
+            label = name or f"FlashMod[{i}]"
             try:
                 enabled = bool(self._com_call(lambda m=mod: m.Enabled))
             except Exception:
                 enabled = True
             if not enabled:
+                skipped_safety.append({"name": label,
+                                       "reason": "disabled in flash configuration"})
+                continue
+            haystack = f"{name} {desc}".lower()
+            hit = next((p for p in skip_list if p in haystack), None)
+            if hit:
+                skipped_safety.append({
+                    "name": label,
+                    "reason": f"skip pattern {hit!r} (one-time-programmable area?)",
+                    "hint": "burn it deliberately with "
+                            "ude_load_program(program_all=True)"})
                 continue
             self._call_mod_config(mod, erase, True, notes)
             if verify_mode:
@@ -1064,13 +1206,15 @@ class RealUdeBackend:
                     "error": "all fill methods failed (service mode? section outside "
                              "enabled flash modules?)",
                     "fill_attempts": fill_attempts, "notes": notes,
+                    "skipped_safety": skipped_safety,
                     "memtool": self._memtool_info(memtool)}
         fill = fill_attempts[-1]["method"]
         diag = self._memtool_info(memtool)
 
         if params.get("flash", True) is False:
             return {"ok": True, "mode": "load_only", "fill": fill,
-                    "fill_attempts": fill_attempts, "notes": notes, "memtool": diag}
+                    "fill_attempts": fill_attempts, "notes": notes,
+                    "skipped_safety": skipped_safety, "memtool": diag}
 
         # 3. 逐模块烧写/校验（只处理有数据段的模块）
         programmed, verified, skipped = [], [], []
@@ -1091,6 +1235,7 @@ class RealUdeBackend:
                 if not res:
                     return {"ok": False, "error": f"VerifySections failed on {name}",
                             "verified": verified, "fill": fill, "notes": notes,
+                            "skipped_safety": skipped_safety,
                             "memtool": diag}
                 verified.append(name)
                 continue
@@ -1110,13 +1255,15 @@ class RealUdeBackend:
                 return {"ok": False,
                         "error": f"ProgramSections failed on {name}: {err}",
                         "programmed": programmed, "fill": fill, "notes": notes,
+                        "skipped_safety": skipped_safety,
                         "memtool": diag}
             programmed.append(name)
         return {"ok": True,
                 "mode": "verify" if params.get("verify_only") else "program_all",
                 "fill": fill, "fill_attempts": fill_attempts, "erase_mode": erase,
                 "verify_mode": verify_mode, "programmed": programmed,
-                "verified": verified, "skipped": skipped, "notes": notes, "memtool": diag}
+                "verified": verified, "skipped": skipped,
+                "skipped_safety": skipped_safety, "notes": notes, "memtool": diag}
 
     def _call_mod_config(self, mod, name, value, notes):
         try:
@@ -1142,8 +1289,13 @@ class RealUdeBackend:
             ok = bool(self._com_call(dbg.LoadAndFlash, path, options))
         except Exception as e:
             return {"ok": False, "error": f"LoadAndFlash({path!r}, {options!r}) exception: {e}"}
-        return {"ok": ok, "mode": "load_and_flash", "options": options,
-                "error": None if ok else f"LoadAndFlash({path!r}, {options!r}) returned False"}
+        result = {"ok": ok, "mode": "load_and_flash", "options": options,
+                  "error": None if ok else f"LoadAndFlash({path!r}, {options!r}) returned False"}
+        if params.get("_flash_skip"):
+            result["flash_filter"] = ("not applied — LoadAndFlash is black-box and "
+                                      "burns everything the file contains; use "
+                                      "strategy=memtool to honor skip_modules")
+        return result
 
     def _load_multicore(self, dbg, path, params):
         """MultiCoreLoader 路径（对应 UI: Download → multicore 确认）。
@@ -1179,9 +1331,14 @@ class RealUdeBackend:
                 ok = False
             if ok:
                 break
-        return {"ok": ok, "mode": "download", "file_index": idx, "cores": cores,
-                "options": used,
-                "error": None if ok else f"DoDownload failed (tried {candidates}): {err}"}
+        result = {"ok": ok, "mode": "download", "file_index": idx, "cores": cores,
+                  "options": used,
+                  "error": None if ok else f"DoDownload failed (tried {candidates}): {err}"}
+        if params.get("_flash_skip"):
+            result["flash_filter"] = ("not applied — DoDownload runs the full download "
+                                      "configuration (may raise the OTP Memory Programming "
+                                      "tool); use strategy=memtool to honor skip_modules")
+        return result
 
     def _function_at(self, dbg, addr):
         """地址 → 函数名：Symbols.Functions.ItemFromAddress(addr).Name。

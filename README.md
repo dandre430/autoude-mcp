@@ -37,31 +37,34 @@ Claude Desktop、Cursor、Windsurf、Cline、Zed ……
 
 验证工程可用：UDE Studio 里打开它，确认能 Halt/Run 目标。
 
-### 工程怎么告诉 agent
+### 工程 / 程序怎么告诉 agent
 
 两种方式，按需选一（或混用，工具参数优先）：
 
-**方式一：配置为本地默认工程**（固定一块板的场景，推荐）
+**方式一：配置为本地默认路径**（固定一块板、固定烧一个产物，推荐）
 
-在 `windows\config.json` 里加 `default_wsx`：
+在 `windows\config.json` 里配好工程和程序文件：
 
 ```json
 {
-  "default_wsx": "C:\\Users\\Public\\Documents\\pls\\UDE 4.10\\Workspaces\\tc397.wsx"
+  "default_wsx": "C:\\Users\\Public\\Documents\\pls\\UDE 4.10\\Workspaces\\tc397.wsx",
+  "default_elf": "D:\\work\\proj\\_bin\\swb\\project_A.elf"
 }
 ```
 
-之后 agent 直接说"连目标板"即可，`ude_start` 不带参数就会打开它，
-无需每次报路径。
+之后 agent 直接说"连目标板、烧写"即可，`ude_start` / `ude_load_program`
+不带参数就用它们，无需每次报路径。
 
 **方式二：对话里告诉 agent**
 
-> 「用 `D:\work\myboard.wsx` 连板子」
+> 「用 `D:\work\myboard.wsx` 连板子，烧 `D:\work\proj\_bin\swb\project_B.elf`」
 
-agent 会把路径传给 `ude_start` 的 `wsx` 参数（WSL 路径如 `/mnt/c/...` 会
-自动转换）。适合多块板 / 多工程切换。
+agent 会把路径传给 `ude_start` 的 `wsx` 参数和 `ude_load_program` 的 `elf`
+参数（WSL 路径如 `/mnt/c/...` 会自动转换）。适合多块板 / A/B 多镜像切换。
 
-优先级：`ude_start(wsx=...)` 参数 > `config.json` 的 `default_wsx`。
+优先级：工具参数 > `config.json` 的 `default_wsx` / `default_elf`。
+注意 `ude_start` 的 elf 参数只在显式传了才烧写——打开工程 ≠ 烧写；
+烧写统一走 `ude_load_program`（可不带参数）。
 
 ## 系统要求
 
@@ -84,7 +87,7 @@ cd autoude-mcp
 pip install -r requirements.txt
 ```
 
-**2. 配置 UDE 路径和默认工程**
+**2. 配置 UDE 路径、默认工程和源码根**
 
 编辑 `windows\config.json`：
 
@@ -92,12 +95,19 @@ pip install -r requirements.txt
 {
   "backend": "real",
   "default_wsx": "C:\\Users\\Public\\Documents\\pls\\UDE 4.10\\Workspaces\\tc397-5.wsx",
-  "ude_exe": "D:\\Program Files (x86)\\pls\\UDE 4.10\\UDEVisualPlatform.exe"
+  "default_elf": "D:\\work\\proj\\_bin\\swb\\project_A.elf",
+  "ude_exe": "D:\\Program Files (x86)\\pls\\UDE 4.10\\UDEVisualPlatform.exe",
+  "source_roots": ["D:\\work\\proj"]
 }
 ```
 
-`ude_exe` 装在常见默认位置可留空（自动探测）；`default_wsx` 见上文
-「工程怎么告诉 agent」，不配也行（每次由 agent 传工程路径）。
+| 字段 | 必要性 | 说明 |
+|---|---|---|
+| `ude_exe` | 可选 | 装在常见默认位置可留空（自动探测） |
+| `default_wsx` | 推荐 | 默认 UDE 工程，见「工程 / 程序怎么告诉 agent」；不配则每次由 agent 传 |
+| `default_elf` | 推荐 | 默认程序文件，`ude_load_program()` 不带参数就烧它 |
+| `source_roots` | **必配** | 工程源码根目录，弹框哨兵靠它自动填源文件定位框，见「弹窗怎么办」 |
+| `flash_skip_modules` | 可选 | 默认 `["OTP","UCB","BMHD"]`，见「烧写：会写哪些地址」 |
 
 **3. 注册到 agent**
 
@@ -178,16 +188,76 @@ claude mcp add ude -- /path/to/autoude-mcp/.venv/bin/python \
 WSL 默认走 pipe 模式连 Windows 常驻服务；工具参数里的 WSL 路径（`/mnt/c/...`）
 会自动转成 Windows 路径。
 
+## 烧写：会写哪些地址？
+
+**烧哪些地址不由工具参数指定**，由文件和 UDE 工程的 Flash 配置共同决定：
+
+| 谁决定 | 内容 |
+|---|---|
+| 文件本身（elf/hex/s19） | 有哪些数据段、各自的地址 |
+| UDE 工程的 Flash 配置 | 有哪些 Flash 模块、地址窗多大、使能与否 |
+| `skip_modules`（本工具） | 哪些模块**不**烧——默认跳过一次性区 |
+
+`ude_load_program` 把文件里的数据段填进 Memtool，**每个段落在哪个 Flash 模块的
+地址窗内，就由哪个模块烧**；文件里没有的地址不写，没使能的模块不写。
+
+**一次性区保护（默认开）**：OTP、UCB、BMHD 这类一次性可编程区烧错无法挽回，
+默认按模块名/描述子串跳过（`flash_skip_modules`，默认 `["OTP","UCB","BMHD"]`）。
+确要烧时二选一：显式 `ude_load_program(program_all=True)`，或传
+`skip_modules="UCB"` 自定义跳过列表。
+
+烧前用 `ude_flash_info` 预览：每个模块的名称/地址窗/数据段数量（有数据 = 会
+被烧）；烧写结果里的 `skipped_safety` 列出本次被跳过的模块和原因。
+
+> `strategy=load_and_flash` / `multicore` 是黑盒一把梭，文件里有什么烧什么，
+> **不做模块过滤**（结果里会注明）。要保护生效用默认的 `strategy=auto`（走
+> Memtool 配方，逐模块 `ProgramSections`）。
+
+## 弹窗（模态框）怎么办？
+
+UDE 的模态框会把 COM 调用整条卡死，无人值守必须处理。两类：
+
+**1. 源文件定位框**（调试时弹）
+
+原因：ELF DWARF 里记录的编译路径在本机不存在，UDE 打开源码窗口时弹框找
+`.c` 文件。解法：bridge server 自带**弹框哨兵**（`dialog_sentinel`），轮询
+发现这类框后在 `source_roots` 里搜同名文件自动填入确认：
+
+```json
+"dialog_sentinel": true,
+"dialog_action": "auto_fill",
+"source_roots": ["D:\\WinGitWorkspace\\APA_TC397_APP"]
+```
+
+**`source_roots` 是开箱必配项**——填你的工程源码根目录（可多个，递归索引
+`.c/.h/.cpp...`）。加载程序时 ELF 所在目录会自动登记为搜索根。找不到时哨兵
+直接关框：不显示源码，但断点/变量/调用栈等调试不受影响。不想自动填可改
+`"dialog_action": "cancel"`。
+
+**2. 烧写类弹框**（下载时弹）
+
+典型：Memtool 下载后的确认框、OTP Memory Programming tool（曾把自动化卡死）。
+三层防护：
+
+1. **预防**：Memtool 配方里 `ScriptIsRunning=True` 关下载后弹窗、擦除模式预设
+   免选项框；`strategy=auto` 不走 `DoDownload`（OTP 工具的来源）。
+2. **兜底**：哨兵按 `dialog_blockers` 文本特征（默认 `"OTP Memory Programming"`、
+   `"Memory Programming"`）识别并**直接关掉**——宁可中止操作，也不误确认烧写。
+   遇到新的弹框文本可往这个列表里加。
+3. **超时**：万一还是卡住，工具调用以 timeout 报错并提示检查 UDE 窗口，不会永久挂起。
+
 ## 给 agent 的典型指令
 
-配好 `default_wsx` 后：
+配好 `default_wsx` + `default_elf` 后：
 
-> 「连上目标板，加载 `project_A.elf`，在 `Com_MainFunctionTx` 打断点，
-> 跑起来，命中后把调用栈和 `g_CoreCounter` 给我看」
+> 「连上目标板烧写，在 `Com_MainFunctionTx` 打断点，跑起来，命中后把调用栈
+> 和 `g_CoreCounter` 给我看」
 
-未配默认工程时，加上工程路径：
+（`ude_start()`、`ude_load_program()` 都无需报路径）
 
-> 「用 `D:\work\tc397-5.wsx` 连上目标板，加载 `project_A.elf`，……」
+临时换工程/产物时带上路径：
+
+> 「用 `D:\work\tc397-5.wsx` 连上目标板，烧 `D:\work\proj\_bin\swb\project_B.elf`，……」
 
 典型流程：`ude_start`（或对已打开的 UDE 用 `ude_attach`）→ `ude_load_program`
 → `ude_breakpoint_add` → `ude_go` → `ude_wait_halt` → `ude_read_variable` /

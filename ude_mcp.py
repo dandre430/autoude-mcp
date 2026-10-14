@@ -63,7 +63,9 @@ def ude_start(wsx: str = "", cfg: str = "", elf: str = "", exe: str = "") -> str
     windows/config.json 里配置的 default_wsx（本地默认工程），适合固定一块板
     的场景；用户明确指定工程时才传这个参数。
     cfg: 目标配置文件（.cfg）——传了就据此新建 workspace；留空则直接打开已有 wsx。
-    可选 elf: 启动后立即加载烧写；exe: UDE 可执行文件路径（默认自动探测）。
+    可选 elf: 启动后**显式**加载烧写（不会自动用 default_elf——烧写只发生在
+    明确要求时；要烧写用 ude_load_program，它的 elf 可留空走 default_elf）。
+    exe: UDE 可执行文件路径（默认自动探测）。
     WSL 路径会自动转成 Windows 路径。"""
     params = {}
     if wsx:
@@ -96,29 +98,46 @@ def ude_close() -> str:
 
 
 @mcp.tool()
-def ude_load_program(elf: str, flash: bool = True, verify_only: bool = False,
+def ude_load_program(elf: str = "", flash: bool = True, verify_only: bool = False,
                      strategy: str = "auto", erase_mode: str = "AutoErase",
-                     options: str = "") -> str:
-    """加载/烧写程序到目标板。elf 为程序文件路径（.hex/.s19 更稳，.elf 亦可）；
+                     options: str = "", skip_modules: str = "",
+                     program_all: bool = False) -> str:
+    """加载/烧写程序到目标板。elf 为程序文件路径（.hex/.s19 更稳，.elf 亦可），
+    **可以留空**——留空则用服务端 windows/config.json 里的 default_elf。
     flash=True 烧写 Flash，verify_only=True 仅校验，flash=False 只加载不烧写。
+
+    烧哪些地址不由工具参数指定：文件（elf/hex）里每个数据段落在哪个 Flash
+    模块的地址窗内，就由哪个模块烧；文件里没有的地址不写。能控制的是
+    "哪些模块不烧"——skip_modules 为逗号分隔的模块名/描述子串，命中的模块
+    排除（默认 OTP,UCB,BMHD——一次性可编程区，烧错无法挽回）。确要烧这些区
+    时显式传 program_all=True。烧前可先用 ude_flash_info 查看各模块地址窗与
+    数据段数量。注意 strategy=load_and_flash/multicore 是黑盒一把梭，不做模块
+    过滤（结果里会注明）。
+
     strategy: auto（默认，Memtool 配方：LoadFile+ProgramSections，失败退回
     LoadAndFlash）| memtool | load_and_flash | multicore（MultiCoreLoader
     DoDownload，可能弹模态框）。
     erase_mode: AutoErase（默认）| AutoChipErase | SimulateRAM。
     options: 透传给 LoadAndFlash 的选项字符串。"""
-    params = {"path": _wp(elf), "flash": flash, "verify_only": verify_only,
-              "strategy": strategy}
+    params = {"flash": flash, "verify_only": verify_only, "strategy": strategy}
+    if elf:
+        params["path"] = _wp(elf)
     if erase_mode:
         params["erase_mode"] = erase_mode
     if options:
         params["options"] = options
+    if skip_modules:
+        params["skip_modules"] = skip_modules
+    if program_all:
+        params["program_all"] = True
     return _call(proto.LOAD_PROGRAM, params, timeout=300.0)
 
 
 @mcp.tool()
 def ude_flash_info() -> str:
-    """诊断：列出 Memtool 的 Flash 模块（名称/描述/使能/扇区/段数量）。
-    烧写前可先用它确认 OTP 等特殊 Flash 模块的状态。"""
+    """诊断：列出 Memtool 的 Flash 模块（名称/描述/使能/扇区数/地址窗/数据段）。
+    烧写前先用它看"这次会烧哪些地址"——文件数据段落在哪个模块的地址窗内就由
+    哪个模块烧；OTP 等一次性模块默认被 ude_load_program 跳过（见 skip_modules）。"""
     return _call(proto.FLASH_INFO)
 
 

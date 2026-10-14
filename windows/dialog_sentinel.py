@@ -1,15 +1,22 @@
-r"""UDE 弹框哨兵：自动处理模态对话框（典型：命中断点后的源文件定位框）。
+r"""UDE 弹框哨兵：自动处理模态对话框（源文件定位框、Memtool/OTP 弹框）。
 
-背景：UDE 在命中断点打开源码窗口时，若按 DWARF 里的编译路径找不到 .c 文件，
-会弹出文件选择框等用户指定。模态框会阻塞 UDE 的 COM 调用，把 bridge 的
-BackendWorker 整条队列卡死。本模块在 Windows 侧轮询 UDE 的顶层对话框，自动
-填入正确源文件路径（或直接取消），解除阻塞。
+背景：模态框会阻塞 UDE 的 COM 调用，把 bridge 的 BackendWorker 整条队列卡死。
+两类典型弹框：
+
+1. 源文件定位框——UDE 命中断点打开源码窗口时，按 DWARF 里的编译路径找不到
+   .c 文件就弹框等用户指定。哨兵在 source_roots 里找到同名文件后自动填路径
+   确认（或直接取消）。
+2. 烧写类弹框——Memtool 下载后的确认框、OTP Memory Programming tool 等。
+   正常情况下 _load_memtool 用 ScriptIsRunning=True 预防；万一还是弹了，
+   哨兵按 dialog_blockers 文本特征识别并直接关掉（宁可中止操作也不误确认）。
 
 config.json:
   "dialog_sentinel": true,          # 总开关（缺省 true，非 Windows 自动关闭）
   "dialog_action": "auto_fill",     # auto_fill：查到源文件就填路径确认
                                     # cancel：直接关掉（不显示源码，但不挡调试）
   "source_roots": ["D:\\proj"]      # auto_fill 的源文件搜索根目录
+  "dialog_blockers": ["OTP Memory Programming", "Memory Programming"]
+                                    # 文本命中即关的烧写类弹框（子串匹配，可改）
 """
 
 import os
@@ -27,6 +34,10 @@ WM_CLOSE = 0x0010
 WM_COMMAND = 0x0111
 IDOK = 1
 
+# 烧写类弹框：文本命中即关（下载链路的正解在 _load_memtool 的 ScriptIsRunning，
+# 这里只是兜底；关掉=中止该弹框对应的操作，不会误确认烧写）
+DEFAULT_BLOCKERS = ["OTP Memory Programming", "Memory Programming"]
+
 
 class SourceIndex:
     """basename(小写) → 源文件完整路径。首次查询时惰性扫描。"""
@@ -36,11 +47,41 @@ class SourceIndex:
         self._map = None
         self._lock = threading.Lock()
 
+    def add_root(self, root):
+        """追加搜索根（如加载 ELF 时顺带登记它所在目录），幂等。"""
+        if not root:
+            return
+        root = os.path.abspath(root)
+        with self._lock:
+            if root in self.roots:
+                return
+            self.roots.append(root)
+            if self._map is not None:
+                self._map.update(self._scan(root))
+
     def find(self, basename):
         with self._lock:
             if self._map is None:
                 self._map = self._build()
         return self._map.get(basename.lower())
+
+    @staticmethod
+    def _scan(root):
+        mapping = {}
+        if not os.path.isdir(root):
+            return mapping
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fn in filenames:
+                if fn.lower().endswith((".c", ".h", ".cpp", ".hpp", ".cc", ".cxx")):
+                    mapping.setdefault(fn.lower(), os.path.join(dirpath, fn))
+        return mapping
+
+    def _build(self):
+        mapping = {}
+        for root in self.roots:
+            mapping.update(self._scan(root))
+        return mapping
 
     def _build(self):
         mapping = {}
@@ -63,9 +104,20 @@ class DialogSentinel:
         if self.action not in ("auto_fill", "cancel"):
             self.action = "auto_fill"
         self.index = SourceIndex(config.get("source_roots") or [])
+        blockers = config.get("dialog_blockers")
+        if blockers is None:
+            blockers = DEFAULT_BLOCKERS
+        self.blockers = [str(b).lower() for b in blockers if str(b).strip()]
         self._handled = {}          # (hwnd, filename) -> ts（句柄会复用，满了清空）
         self._stop = threading.Event()
         self._thread = None
+
+    def add_root(self, root):
+        """登记源文件搜索根（backend 加载程序后把 ELF 所在目录送进来）。"""
+        try:
+            self.index.add_root(root)
+        except Exception:
+            pass
 
     def start(self):
         if not self.enabled:
@@ -93,6 +145,20 @@ class DialogSentinel:
                 if win32gui.GetClassName(hwnd) != "#32770":
                     return
                 texts = self._collect_texts(hwnd)
+                # 1) 烧写类弹框：文本特征命中直接关（在源文件逻辑之前）
+                low = (texts or "").lower()
+                for pat in self.blockers:
+                    if pat not in low:
+                        continue
+                    key = (hwnd, f"blocker:{pat}")
+                    if key in self._handled:
+                        return
+                    if len(self._handled) > 512:
+                        self._handled.clear()
+                    self._handled[key] = True
+                    self._close(hwnd, f"blocker:{pat}", "closed (flash blocker)")
+                    return
+                # 2) 源文件定位框
                 fname = self._extract_filename(texts)
                 if not fname:
                     return
