@@ -1,5 +1,6 @@
 {
   "backend": "real",
+  "default_wsx": "C:\\Users\\Public\\Documents\\pls\\UDE 4.10\\Workspaces\\tc397.wsx",
   "pipe_name": "\\\\.\\pipe\\ude_bridge",
   "ude_exe": "D:\\Program Files (x86)\\pls\\UDE 4.10\\UDEVisualPlatform.exe",
   "dialog_sentinel": true,

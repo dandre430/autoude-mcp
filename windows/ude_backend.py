@@ -61,7 +61,8 @@ class MockUdeBackend:
 
     STATE_NAMES = {-1: "not_connected", 0: "halted", 1: "running", 2: "inactive"}
 
-    def __init__(self):
+    def __init__(self, config: dict = None):
+        self.config = config or {}
         self.session = False
         self.state_code = -1              # UDE GetState 语义
         self.program_file = ""
@@ -84,10 +85,11 @@ class MockUdeBackend:
 
     # ---- 会话 ----
     def ping(self, params):
-        return {"pong": True, "backend": self.name}
+        return {"pong": True, "backend": self.name,
+                "default_wsx": self.config.get("default_wsx") or ""}
 
     def start_session(self, params):
-        wsx = params.get("wsx") or "mock.wsx"
+        wsx = params.get("wsx") or self.config.get("default_wsx") or "mock.wsx"
         cfg = params.get("cfg") or "mock.cfg"
         self.session = True
         self.state_code = 0
@@ -625,14 +627,23 @@ class RealUdeBackend:
 
     # ---- 会话 ----
     def ping(self, params):
-        return {"pong": True, "backend": self.name, "ude_exe": self.ude_exe}
+        return {"pong": True, "backend": self.name, "ude_exe": self.ude_exe,
+                "default_wsx": self.config.get("default_wsx") or ""}
 
     def start_session(self, params):
-        wsx = params.get("wsx")
+        # wsx 两级来源：工具参数优先，否则用 windows/config.json 的 default_wsx
+        wsx = params.get("wsx") or self.config.get("default_wsx")
         cfg = params.get("cfg")
         exe = params.get("exe") or self.ude_exe
         if not wsx:
-            raise BackendError(proto.ERR_BAD_REQUEST, "start_session requires param: wsx")
+            raise BackendError(
+                proto.ERR_BAD_REQUEST,
+                "start_session: no wsx — pass the wsx tool parameter, or set "
+                '"default_wsx" in windows/config.json')
+        wsx = os.path.expandvars(str(wsx))
+        if not os.path.isabs(wsx):
+            raise BackendError(proto.ERR_BAD_REQUEST,
+                               f"start_session: wsx must be an absolute path: {wsx}")
         # What 参数只接受产品 exe 名（文档 Valid values: UDEVisualPlatform.exe /
         # UDEDesktop.exe），传完整路径会 E_INVALIDARG
         what = "UDEVisualPlatform.exe"
@@ -2014,7 +2025,7 @@ def create_backend(config: dict = None):
     config = config or {}
     kind = (config.get("backend") or "mock").lower()
     if kind == "mock":
-        return MockUdeBackend()
+        return MockUdeBackend(config)
     if kind == "real":
         return RealUdeBackend(config)
     raise BackendError(proto.ERR_BAD_REQUEST, f"unknown backend: {kind}")

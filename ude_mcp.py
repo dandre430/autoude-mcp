@@ -53,14 +53,21 @@ def _wp(path: str) -> str:
 # ---------------- 会话管理 ----------------
 
 @mcp.tool()
-def ude_start(wsx: str, cfg: str = "", elf: str = "", exe: str = "") -> str:
-    """启动 UDE 实例（不需要人工打开 UI）。
+def ude_start(wsx: str = "", cfg: str = "", elf: str = "", exe: str = "") -> str:
+    """启动 UDE 实例并打开已有工程（目标板连接配置必须已在工程里配好）。
 
-    wsx: workspace 工程文件路径（.wsx）。
-    cfg: 目标配置文件（.cfg）——传了就新建 workspace；留空则直接打开已有 wsx。
+    注意：本工具不从零创建 UDE 工程——目标配置/调试核/连接密码需事先在
+    UDE Studio 向导里建好并保存为 .wsx（从零建工程请手动做一次）。
+
+    wsx: workspace 工程文件路径（.wsx）。**可以留空**——留空则用服务端
+    windows/config.json 里配置的 default_wsx（本地默认工程），适合固定一块板
+    的场景；用户明确指定工程时才传这个参数。
+    cfg: 目标配置文件（.cfg）——传了就据此新建 workspace；留空则直接打开已有 wsx。
     可选 elf: 启动后立即加载烧写；exe: UDE 可执行文件路径（默认自动探测）。
     WSL 路径会自动转成 Windows 路径。"""
-    params = {"wsx": _wp(wsx)}
+    params = {}
+    if wsx:
+        params["wsx"] = _wp(wsx)
     if cfg:
         params["cfg"] = _wp(cfg)
     if elf:
