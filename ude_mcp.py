@@ -1,11 +1,9 @@
-r"""UDE Studio 控制 MCP 服务器（WSL 或纯 Windows 均可运行，stdio）。
+r"""UDE Studio 控制 MCP 服务器（标准 stdio MCP，任意 MCP 客户端可接）。
 
-WSL 注册到 Claude Code：
-  claude mcp add ude -- /home/zhuangzhuangduan/projects/autoude/.venv/bin/python \
-      /home/zhuangzhuangduan/projects/autoude/ude_mcp.py
-
-纯 Windows 注册（cmd）：
-  claude mcp add ude -- C:\Python313\python.exe D:\ude-agent\ude_mcp.py
+启动方式（客户端按 MCP 配置拉起本脚本，WSL 或纯 Windows 皆可）：
+  python ude_mcp.py
+  # 例：Claude Code —— claude mcp add ude -- <python> <...>/ude_mcp.py
+  # 例：Cursor/Windsurf 等 —— mcpServers 配 {"command": python, "args": [ude_mcp.py]}
 
 环境变量：
   UDE_BRIDGE_MODE        stdio（纯 Windows 默认：本地子进程）

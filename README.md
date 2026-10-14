@@ -1,7 +1,9 @@
-# UDE Studio 控制 MCP
+# UDE Studio 控制 MCP（autoude-mcp）
 
-给 Claude Code 用的 MCP 服务器：驱动 Windows 上的 PLS UDE Studio（COM 自动化
-接口），实现固件加载、运行控制、变量/内存/寄存器读写、断点管理等调试操作。
+给支持 MCP 的 AI agent 用的调试服务器：驱动 Windows 上的 PLS UDE Studio
+（COM 自动化接口），实现固件加载、运行控制、变量/内存/寄存器读写、断点管理
+等调试操作。标准 MCP stdio 服务器，Claude Code / Cursor / Windsurf / Cline /
+Claude Desktop 等任意 MCP 客户端都能接。
 
 支持两种宿主环境：
 
@@ -14,22 +16,22 @@
 
 ```
 WSL 拓扑：
-Claude Code ──stdio──> ude_mcp.py (WSL)
-                          │ bridge_client.py（持久子进程）
-                          ▼
-               npiperelay.exe ⇄ \\.\pipe\ude_bridge
-                          ▼
-               ude_bridge_server.py (Windows, pywin32)
-                          ▼ win32com
-               UDE COM (UDELauncher / UDERunningInstanceManager) ──> UDE Studio
+MCP 客户端 ──stdio──> ude_mcp.py (WSL)
+                        │ bridge_client.py（持久子进程）
+                        ▼
+             npiperelay.exe ⇄ \\.\pipe\ude_bridge
+                        ▼
+             ude_bridge_server.py (Windows, pywin32)
+                        ▼ win32com
+             UDE COM (UDELauncher / UDERunningInstanceManager) ──> UDE Studio
 
 纯 Windows 拓扑（默认 stdio）：
-Claude Code ──stdio──> ude_mcp.py (Windows)
-                          │ bridge_client.py（本地子进程）
-                          ▼
-               ude_bridge_server.py --stdio (同机, pywin32)
-                          ▼ win32com
-               UDE COM ──> UDE Studio (UDEVisualPlatform.exe)
+MCP 客户端 ──stdio──> ude_mcp.py (Windows)
+                        │ bridge_client.py（本地子进程）
+                        ▼
+             ude_bridge_server.py --stdio (同机, pywin32)
+                        ▼ win32com
+             UDE COM ──> UDE Studio (UDEVisualPlatform.exe)
 ```
 
 ## 目录
@@ -48,8 +50,10 @@ Claude Code ──stdio──> ude_mcp.py (Windows)
 1. 安装 Python 3.10+（带 pip），装依赖：
 
    ```bat
-   pip install mcp pywin32
+   pip install -r requirements.txt
    ```
+
+   （即 `mcp` + `pywin32`，后者由 `sys_platform == 'win32'` 标记控制。）
 
 2. 把本项目整个目录拷到 Windows 本地，例如 `D:\ude-agent\`
    （`protocol.py` 与 `windows\` 必须保持同级目录）。
@@ -70,18 +74,13 @@ Claude Code ──stdio──> ude_mcp.py (Windows)
    `backend: "real"` 对接真实 UDE，`"mock"` 为无硬件自测；
    `ude_exe` 留空则自动探测常见 UDE 安装位置。
 
-4. 注册到 Claude Code（cmd）：
+4. 按下文「注册到 MCP 客户端」把 `ude_mcp.py` 挂进你用的 agent。
+   默认 `UDE_BRIDGE_MODE=stdio`：ude_mcp.py 会自动拉起
+   `windows\ude_bridge_server.py --stdio` 子进程，**不需要手动启动服务端，
+   也不需要 npiperelay**。
 
-   ```bat
-   claude mcp add ude -- C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python313\python.exe D:\ude-agent\ude_mcp.py
-   ```
-
-   或 PowerShell 下用完整 python.exe 路径。默认 `UDE_BRIDGE_MODE=stdio`：
-   ude_mcp.py 会自动拉起 `windows\ude_bridge_server.py --stdio` 子进程，
-   **不需要手动启动服务端，也不需要 npiperelay**。
-
-5. （可选）长驻管道模式：想让服务端常驻（多个 MCP 客户端共享、重启 Claude 不
-   断 UDE 会话），先手动起服务端：
+5. （可选）长驻管道模式：想让服务端常驻（多个 agent 共享、重启客户端不断 UDE
+   会话），先手动起服务端：
 
    ```bat
    cd /d D:\ude-agent\windows
@@ -113,14 +112,65 @@ cd C:\path\to\autoude\windows
 python ude_bridge_server.py
 ```
 
-## 注册到 Claude Code（WSL）
+## 注册到 MCP 客户端（通用）
+
+MCP 服务器就是一个 stdio 子进程，注册的本质是给客户端一段启动命令：
+
+```
+command = <装了依赖的 Python> <路径>/ude_mcp.py
+```
+
+通用配置格式（绝大多数客户端认这个结构）：
+
+```json
+{
+  "mcpServers": {
+    "ude": {
+      "command": "C:\\Users\\me\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "args": ["D:\\ude-agent\\ude_mcp.py"],
+      "env": { "UDE_BRIDGE_MODE": "pipe" }
+    }
+  }
+}
+```
+
+`env` 可选，不填就用下文「环境变量」的默认值。Linux/WSL 侧把 command 换成
+`.venv/bin/python` 即可。
+
+各家客户端只是配置文件位置不同：
+
+| 客户端 | 配置位置 | 备注 |
+|---|---|---|
+| Claude Code | `claude mcp add ude -- <python> <...>/ude_mcp.py` | 也可直接写项目 `.mcp.json` |
+| Claude Desktop | `claude_desktop_config.json` | Windows 在 `%APPDATA%\Claude\` |
+| Cursor | `.cursor/mcp.json`（项目）或全局 `mcp.json` | |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | |
+| Cline / Roo Code | VS Code 扩展的 MCP Servers 设置 | |
+| Zed | `~/.config/zed/settings.json` 的 `context_servers` | |
+| 其他 | 任何支持 MCP stdio 的客户端 | 用上面的通用 JSON |
+
+Claude Code 的具体命令：
 
 ```bash
+# 纯 Windows（cmd / PowerShell）
+claude mcp add ude -- C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python313\python.exe D:\ude-agent\ude_mcp.py
+
+# WSL
 claude mcp add ude -- /home/zhuangzhuangduan/projects/autoude/.venv/bin/python \
     /home/zhuangzhuangduan/projects/autoude/ude_mcp.py
 ```
 
-环境变量（可选，`claude mcp add ude -e KEY=VAL ...` 传入）：
+注意：
+
+- **command 必须指向装了 `mcp`（以及 Windows 上 `pywin32`）的 Python**，
+  系统裸 python 常常没装。
+- 跑在 Windows 的客户端配纯 Windows 形态（`D:\ude-agent\ude_mcp.py`）；
+  跑在 WSL/Linux 的客户端才用 WSL 形态。
+- 多个客户端可同时注册同一个 server 文件。会话起 → `ude_mcp.py` 子进程起；
+  会话结束 → 进程退出。stdio 模式各自拉各自的 bridge server；
+  `UDE_BRIDGE_MODE=pipe` 时可共享同一个常驻 server。
+
+### 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -170,4 +220,3 @@ WSL 路径参数（如 `/mnt/c/...`）会自动转换为 Windows 路径。
 
 错误码：`no_session` / `not_connected` / `bad_request` / `unknown_action` /
 `backend_error` / `timeout` / `comm_error`。
-# autoude-mcp
