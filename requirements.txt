@@ -1,0 +1,9 @@
+# MCP 服务器 + bridge client（WSL 或 Windows 皆可）
+# 代码用的是 mcp 2.x 的 MCPServer API (mcp.server.mcpserver)
+mcp>=2.0.0
+
+# ude_bridge_server.py 的 UDE COM 后端（仅 Windows 有意义，WSL 上自动跳过）
+pywin32; sys_platform == 'win32'
+
+# WSL+Windows 拓扑：Windows 侧常驻 server 跑在 Windows Python 里，
+# 那边也要 pip install pywin32（本文件只覆盖跑 ude_mcp.py 的环境）。

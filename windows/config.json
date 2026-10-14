@@ -1,0 +1,8 @@
+{
+  "backend": "real",
+  "pipe_name": "\\\\.\\pipe\\ude_bridge",
+  "ude_exe": "D:\\Program Files (x86)\\pls\\UDE 4.10\\UDEVisualPlatform.exe",
+  "dialog_sentinel": true,
+  "dialog_action": "auto_fill",
+  "source_roots": ["D:\\WinGitWorkspace\\APA_TC397_APP"]
+}
